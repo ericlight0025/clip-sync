@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build output
+dist/
+build/
+spec/
+_pkg_src/
+*.spec
+
+# Runtime generated
+settings.json
+
+# Temp / local
+temp/
+*.log
