@@ -22,7 +22,7 @@ from config import (
     HOSTNAME_LABEL, THEMES, CURRENT_THEME,
     RESIZE_HANDLE_SIZE,
 )
-from sync_service import SyncService
+from sync_service import ClipConflictError, SyncService
 
 
 class SharedPasteDashboard:
@@ -41,6 +41,7 @@ class SharedPasteDashboard:
         self.root.attributes("-alpha", ALPHA_FOCUSED)
         self.root.configure(bg=self._t['BG'])
         self.root.overrideredirect(True)
+        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
 
         # 應用狀態
         self.current_file       = None
@@ -133,7 +134,7 @@ class SharedPasteDashboard:
 
         # 關閉
         self.btn_close = tk.Button(
-            self.title_bar, text="✕", command=self.root.destroy,
+            self.title_bar, text="✕", command=self.on_close,
             bg=self._c('TITLE_BG'), fg=self._c('FG'),
             activebackground="#c42b1c", activeforeground="#ffffff",
             relief="flat", width=4, font=(FONT_CODE_NAME, 12),
@@ -548,7 +549,8 @@ class SharedPasteDashboard:
     # ----------------------------------------------------------
 
     def open_settings(self):
-        self.flush_pending_write()
+        if not self.flush_pending_write():
+            return
         from ui_settings import SettingsPanel
 
         if not hasattr(self, "settings_panel") or self.settings_panel is None:
@@ -603,12 +605,16 @@ class SharedPasteDashboard:
 
     def reload_clip_list(self):
         try:
+            if self.current_file is None and self.get_text():
+                if not self.flush_pending_write():
+                    return
             files = self.sync.list_clips()
             if self.current_file is None or not self.current_file.exists():
-                self.current_file    = files[0]
-                self.last_text_hash  = ""
-                self.last_file_mtime = 0
-                self.load_from_file(force=True)
+                if self.current_file and self.sync.hash_text(self.get_text()) != self.last_text_hash:
+                    self.set_status('目前檔案已在外部刪除，保留尚未儲存的編輯')
+                    return
+                if not self._activate_clip(files[0]):
+                    return
             self.render_bar(files)
             self.update_current_label()
             self.set_status(f"已載入 {len(files)} 個 clip  {time.strftime('%H:%M:%S')}")
@@ -616,14 +622,14 @@ class SharedPasteDashboard:
             self.set_status(f"重整失敗：{e}")
 
     def select_latest_clip(self):
+        if not self.flush_pending_write():
+            return
         try:
             latest_file = self.sync.latest_clip()
             if not latest_file:
                 return
-            self.current_file    = latest_file
-            self.last_text_hash  = ""
-            self.last_file_mtime = 0
-            self.load_from_file(force=True)
+            if not self._activate_clip(latest_file):
+                return
             self.render_bar(self.sync.list_clips())
             self.update_current_label()
         except Exception as e:
@@ -649,13 +655,26 @@ class SharedPasteDashboard:
     def switch_clip(self, file_path):
         if self.current_file == file_path:
             return
-        self.flush_pending_write()
-        self.current_file    = file_path
-        self.last_text_hash  = ""
-        self.last_file_mtime = 0
-        self.load_from_file(force=True)
+        if not self.flush_pending_write():
+            return
+        if not self._activate_clip(file_path):
+            return
         self.reload_clip_list()
         self.update_simple_label()
+
+    def _activate_clip(self, file_path):
+        """讀取成功才切換檔案狀態，避免斷線時把舊內容當成新檔案編輯。"""
+        try:
+            value = self.sync.read_clip(file_path)
+            mtime = self.sync.mtime(file_path)
+        except (OSError, UnicodeError) as exc:
+            self.set_status(f'無法切換檔案，保留目前編輯：{exc}')
+            return False
+        self.set_text(value)
+        self.current_file = file_path
+        self.last_text_hash = self.sync.hash_text(value)
+        self.last_file_mtime = mtime
+        return True
 
     # ----------------------------------------------------------
     # 顯示模式切換
@@ -753,16 +772,17 @@ class SharedPasteDashboard:
         name = self.ask_clip_name()
         if not name:
             return
+        if not self.flush_pending_write():
+            return
         name = name.strip().replace(".md", "")
         if not re.match(r"^[A-Za-z0-9_-]+$", name):
             messagebox.showwarning("名稱無效", "僅允許英文、數字、底線、連字號", parent=self.root)
             return
         try:
-            self.current_file    = self.sync.create_clip(name)
-            self.last_text_hash  = ""
-            self.last_file_mtime = 0
+            new_file = self.sync.create_clip(name)
+            if not self._activate_clip(new_file):
+                return
             self.reload_clip_list()
-            self.load_from_file(force=True)
             self.update_simple_label()
         except Exception as e:
             messagebox.showwarning("新增失敗", str(e), parent=self.root)
@@ -775,6 +795,9 @@ class SharedPasteDashboard:
         try:
             old = self.current_file
             self.sync.delete_clip(old)
+            if self.pending_write_job:
+                self.root.after_cancel(self.pending_write_job)
+                self.pending_write_job = None
             self.current_file = None
             self.reload_clip_list()
             self.set_status(f"已刪除 {old.name}")
@@ -863,36 +886,71 @@ class SharedPasteDashboard:
         self.pending_write_job = self.root.after(WRITE_DEBOUNCE_MS, self.write_to_file)
 
     def flush_pending_write(self):
+        """儲存成功才允許離開；即使上次寫入失敗，也重新嘗試保存。"""
         if self.pending_write_job:
             self.root.after_cancel(self.pending_write_job)
             self.pending_write_job = None
-            self.write_to_file()
+        return self.write_to_file()
+
+    def on_close(self):
+        """關閉前儲存；寫入失敗時保留視窗及編輯內容。"""
+        if not self.flush_pending_write():
+            messagebox.showwarning('尚未儲存', '文字尚未儲存，請恢復共享資料夾連線後再關閉。', parent=self.root)
+            return
+        if self.highlight_job:
+            self.root.after_cancel(self.highlight_job)
+        self.root.destroy()
 
     def write_to_file(self):
         self.pending_write_job = None
-        if not self.current_file:
-            return
         value      = self.get_text()
         value_hash = self.sync.hash_text(value)
+        if not self.current_file and not value:
+            return True
         if value_hash == self.last_text_hash:
-            return
+            return True
         try:
-            self.last_file_mtime = self.sync.write_clip(self.current_file, value)
+            conflict = False
+            if self.current_file is None:
+                # 啟動時斷線也可保留編輯，恢復後另存，不當成已儲存。
+                self.current_file = self.sync.save_conflict_copy(self.sync.base_dir / 'recovered.md', value)
+                self.last_file_mtime = self.sync.mtime(self.current_file)
+                conflict = True
+            else:
+                try:
+                    self.last_file_mtime = self.sync.write_clip(
+                        self.current_file, value, expected_hash=self.last_text_hash)
+                except ClipConflictError:
+                    # 遠端版本與本機內容都保留，不以最後寫入者覆蓋另一方。
+                    self.current_file = self.sync.save_conflict_copy(self.current_file, value)
+                    self.last_file_mtime = self.sync.mtime(self.current_file)
+                    conflict = True
             self.last_text_hash  = value_hash
-            self.set_status(f"已儲存 {self.current_file.name}  {time.strftime('%H:%M:%S')}")
+            if conflict:
+                self.reload_clip_list()
+                self.set_status(f'同步衝突：本機內容已另存 {self.current_file.name}，遠端原檔保留')
+            else:
+                self.set_status(f"已儲存 {self.current_file.name}  {time.strftime('%H:%M:%S')}")
             self.update_simple_label()
+            return True
         except Exception as e:
-            self.set_status(f"寫入失敗：{e}")
+            self.set_status(f"尚未儲存，將重試：{e}")
+            self.pending_write_job = self.root.after(max(1000, CHECK_INTERVAL_MS), self.write_to_file)
+            return False
 
     def load_from_file(self, force: bool = False):
         if not self.current_file:
             return
         try:
-            mtime = self.sync.mtime(self.current_file)
-            if not force and mtime <= self.last_file_mtime:
-                return
             value      = self.sync.read_clip(self.current_file)
             value_hash = self.sync.hash_text(value)
+            # 本機有未儲存內容時，輪詢只能偵測衝突，不可替換編輯區。
+            if self.sync.hash_text(self.get_text()) != self.last_text_hash and not force:
+                if value_hash != self.last_text_hash:
+                    self.set_status('偵測到同步衝突：將保留遠端原檔並另存本機編輯')
+                return
+            if not force and value_hash == self.last_text_hash:
+                return
             if value_hash != self.last_text_hash:
                 self.set_text(value)
                 self.last_text_hash = value_hash

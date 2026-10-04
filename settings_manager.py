@@ -4,10 +4,15 @@ settings_manager.py — 設定檔讀寫管理
 Distributed under the MIT License. (See LICENSE file for details)
 """
 import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 
 # settings.json 儲存於程式所在目錄
-_SETTINGS_FILE = Path(__file__).parent / "settings.json"
+_SETTINGS_FILE = (Path(sys.executable).parent if getattr(sys, 'frozen', False)
+                  else Path(__file__).parent) / 'settings.json'
+_LEGACY_SETTINGS_FILE = Path(__file__).parent / 'settings.json'
 
 # =============================================================
 # 預設值（程式第一次執行時使用）
@@ -79,9 +84,13 @@ DEFAULTS: dict = {
 
 def load() -> dict:
     """載入 settings.json，若不存在或損毀則回傳預設值。"""
-    if _SETTINGS_FILE.exists():
+    source = _SETTINGS_FILE
+    if (getattr(sys, 'frozen', False) and not source.exists()
+            and _LEGACY_SETTINGS_FILE.exists()):
+        source = _LEGACY_SETTINGS_FILE  # 相容舊版放在 _internal 的設定。
+    if source.exists():
         try:
-            data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+            data = json.loads(source.read_text(encoding="utf-8"))
             # 補齊缺失的 key（升級相容）
             for k, v in DEFAULTS.items():
                 data.setdefault(k, v)
@@ -92,11 +101,20 @@ def load() -> dict:
 
 
 def save(data: dict) -> None:
-    """將設定寫入 settings.json。"""
-    _SETTINGS_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """以唯一暫存檔原子替換設定，打包後儲存在 EXE 旁。"""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                dir=_SETTINGS_FILE.parent, prefix='.settings.', suffix='.tmp',
+                delete=False) as stream:
+            tmp_path = Path(stream.name)
+            stream.write(json.dumps(data, ensure_ascii=False, indent=2))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, _SETTINGS_FILE)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def get(key: str, fallback=None):

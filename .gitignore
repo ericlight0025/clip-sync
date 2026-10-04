@@ -12,6 +12,9 @@ _pkg_src/
 
 # Runtime generated
 settings.json
+*.lock
+*.tmp
+clips/*_conflict_*.md
 
 # Temp / local
 temp/
