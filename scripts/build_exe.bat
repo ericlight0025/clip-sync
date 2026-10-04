@@ -36,9 +36,13 @@ echo.
 :: --- 取得 TCL 路徑 ---
 for /f "delims=" %%I in ('%PYTHON_EXE% %PYTHON_VERSION% -c "import sys; from pathlib import Path; print(Path(sys.base_prefix) / 'tcl')"') do set "TCL_ROOT=%%I"
 
-:: --- 終止舊執行檔 ---
-echo === Kill old exe if running ===
-taskkill /f /im %APP_NAME%.exe >nul 2>nul
+:: 不強制終止編輯器，避免中斷尚未儲存的文字。
+tasklist /FI "IMAGENAME eq %APP_NAME%.exe" /NH | find /I "%APP_NAME%.exe" >nul
+if not errorlevel 1 (
+    echo [ERROR] Please save and close %APP_NAME%.exe before building.
+    pause
+    exit /b 1
+)
 
 :: --- 清除舊建置 ---
 echo === Clean folders ===
@@ -46,7 +50,7 @@ if exist "%PKG_SRC%"  rmdir /s /q "%PKG_SRC%"
 if exist "%OUT_DIR%"  rmdir /s /q "%OUT_DIR%"
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 if exist "%SPEC_DIR%"  rmdir /s /q "%SPEC_DIR%"
-if exist "%FINAL_DIR%" rmdir /s /q "%FINAL_DIR%"
+:: 保留最終目錄的 settings.json 與使用者資料，不遞迴刪除。
 
 mkdir "%PKG_SRC%"
 mkdir "%OUT_DIR%"
@@ -59,6 +63,8 @@ copy "%SRC_DIR%main.py"         "%PKG_SRC%\main.py"         /Y
 copy "%SRC_DIR%config.py"       "%PKG_SRC%\config.py"       /Y
 copy "%SRC_DIR%sync_service.py" "%PKG_SRC%\sync_service.py" /Y
 copy "%SRC_DIR%ui_dashboard.py" "%PKG_SRC%\ui_dashboard.py" /Y
+copy "%SRC_DIR%settings_manager.py" "%PKG_SRC%\settings_manager.py" /Y
+copy "%SRC_DIR%ui_settings.py" "%PKG_SRC%\ui_settings.py" /Y
 
 cd /d "%PKG_SRC%"
 
@@ -70,6 +76,14 @@ echo === Tkinter Test ===
 %PYTHON_EXE% %PYTHON_VERSION% -c "import tkinter; print('tkinter ok')"
 if errorlevel 1 (
     echo [ERROR] Tkinter test failed.
+    pause
+    exit /b 1
+)
+
+:: 確認 staging 中所有入口與設定模組可匯入，提早發現漏檔。
+%PYTHON_EXE% %PYTHON_VERSION% -c "import main, ui_settings, settings_manager; print('imports ok')"
+if errorlevel 1 (
+    echo [ERROR] Source module import test failed.
     pause
     exit /b 1
 )
